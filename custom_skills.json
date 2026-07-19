@@ -1,0 +1,34 @@
+{
+  "skills": [
+    {
+      "name": "search_web",
+      "description": "Search the web for information.",
+      "version": "1.0.0",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {"type": "string"}
+        },
+        "required": ["query"]
+      },
+      "timeout": 10,
+      "memory_limit_mb": 128,
+      "provider": "openai"
+    },
+    {
+      "name": "send_email",
+      "description": "Send an email to a recipient.",
+      "version": "1.0.0",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "to": {"type": "string"},
+          "subject": {"type": "string"},
+          "body": {"type": "string"}
+        },
+        "required": ["to", "subject", "body"]
+      },
+      "provider": "claude"
+    }
+  ]
+}

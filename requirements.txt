@@ -1,0 +1,7 @@
+# Minimum versions actually exercised by the test suite in this repo.
+# Pin exact versions in your own deployment if you need reproducible builds.
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+pydantic>=2.4.2
+requests>=2.31.0
+python-dotenv>=1.0.0
