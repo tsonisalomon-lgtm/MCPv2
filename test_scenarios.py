@@ -60,9 +60,10 @@ def record(name, ok, detail=""):
 
 
 class Peer:
-    def __init__(self, name, port, llm_mode=False, extra_env=None, extra_args=None):
+    def __init__(self, name, port, public_ip=HOST, llm_mode=False, extra_env=None, extra_args=None):
         self.name = name
         self.requested_port = port
+        self.public_ip = public_ip
         self.port = None
         self.proc = None
         self.llm_mode = llm_mode
@@ -76,8 +77,14 @@ class Peer:
         env.update(self.extra_env)
         if os.path.exists(self.port_file):
             os.remove(self.port_file)
+        # NOTE: no --bind-host here. This deliberately exercises the new
+        # default: bind directly to --public-ip, never 0.0.0.0. Each peer
+        # gets its OWN address (127.0.0.1 vs 127.0.0.2) as the closest
+        # honest stand-in for "different host" reachable inside this
+        # sandbox - see README for why true separate physical hosts
+        # aren't something this test environment can reach.
         cmd = [PYTHON, SCRIPT, "--port", str(self.requested_port), "--secret", SECRET,
-               "--bind-host", "0.0.0.0", "--public-ip", HOST, "--log-level", "WARNING",
+               "--public-ip", self.public_ip, "--log-level", "WARNING",
                "--port-file", self.port_file] + self.extra_args
         # IMPORTANT: do NOT use stdout=PIPE/stderr=PIPE here without a
         # reader thread. uvicorn's access logger writes a line per request;
@@ -115,7 +122,7 @@ class Peer:
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                r = requests.get(f"http://{HOST}:{self.port}/health", timeout=1)
+                r = requests.get(f"http://{self.public_ip}:{self.port}/health", timeout=1)
                 if r.status_code == 200:
                     return
             except requests.exceptions.RequestException:
@@ -146,7 +153,7 @@ class Peer:
 
     @property
     def base_url(self):
-        return f"http://{HOST}:{self.port}"
+        return f"http://{self.public_ip}:{self.port}"
 
     def session(self):
         r = requests.get(f"{self.base_url}/mcpv2/session", timeout=5)
@@ -195,14 +202,14 @@ def run_scenarios(iteration: int, peer_a: Peer, peer_b: Peer):
     sys.path.insert(0, HERE)
     import importlib
     mcpv2_local = importlib.import_module("mcpv2")
-    short_token = mcpv2_local.SecureSession.create(HOST, SECRET, ttl=1)
+    short_token = mcpv2_local.SecureSession.create(peer_a.public_ip, SECRET, ttl=1)
     time.sleep(1.5)
     r = peer_a.send(short_token, [slot(1, "ping", {})])
     record(f"{tag} expired session rejected", r.status_code == 401, f"got {r.status_code}")
 
     # 5. Forged-future-timestamp session rejected
     import base64 as b64
-    future_payload = f"{HOST}:noncenonce:{int(time.time())+99999}:60"
+    future_payload = f"{peer_a.public_ip}:noncenonce:{int(time.time())+99999}:60"
     import hmac, hashlib
     sig = hmac.new(SECRET.encode(), future_payload.encode(), hashlib.sha256).hexdigest()
     forged = f"{b64.urlsafe_b64encode(future_payload.encode()).decode()}.{sig}"
@@ -342,14 +349,30 @@ def run_scenarios(iteration: int, peer_a: Peer, peer_b: Peer):
 def main():
     n_runs = int(os.environ.get("MCPV2_TEST_ITERATIONS", "3"))
 
-    peer_a = Peer("A", 8100, llm_mode=False)
-    peer_b = Peer("B", 8101, llm_mode=True,
+    peer_a = Peer("A", 8100, public_ip="127.0.0.1", llm_mode=False)
+    peer_b = Peer("B", 8101, public_ip="127.0.0.2", llm_mode=True,
                   extra_args=["--skills", os.path.join(HERE, "custom_skills.json")])
 
-    print(f"Starting peer A (port ~8100) and peer B (port ~8101, LLM mode on, custom skills)...")
+    print(f"Starting peer A ({peer_a.public_ip}:~8100) and peer B "
+          f"({peer_b.public_ip}:~8101, LLM mode on, custom skills)...")
+    print("NOTE: 127.0.0.1 vs 127.0.0.2 is the closest honest stand-in for")
+    print("\"different host\" reachable inside this sandbox - it genuinely")
+    print("exercises the bind-to-public-IP and per-IP session binding logic,")
+    print("but it is not a substitute for testing across two real separate")
+    print("machines. See README's cross-host section for that setup.\n")
     peer_a.start()
     peer_b.start()
-    print(f"Peer A bound to {peer_a.port}, peer B bound to {peer_b.port}\n")
+    print(f"Peer A bound to {peer_a.public_ip}:{peer_a.port}, "
+          f"peer B bound to {peer_b.public_ip}:{peer_b.port}\n")
+
+    # Sanity-check that each peer's own startup banner advertises a
+    # correctly-formed, reachable address (the feature just added).
+    for p in (peer_a, peer_b):
+        with open(p.log_path) as f:
+            log_contents = f.read()
+        expected = f"MCPV2_PEER_ADDRESS=mcpv2://{p.public_ip}:{p.port}/mcpv2"
+        record(f"[startup] {p.name} printed correct peer address", expected in log_contents,
+               f"expected '{expected}' in log")
 
     try:
         for i in range(1, n_runs + 1):
