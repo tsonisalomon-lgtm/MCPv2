@@ -1053,32 +1053,47 @@ def send_batch(target_url: str, slots: list, session_id: str = None) -> list:
         logger.error(f"Batch send failed: {e}")
         raise
 
-def find_available_port(start_port: int, max_attempts: int = 10, strict: bool = True) -> int:
+def find_available_port(start_port: int, bind_host: str, max_attempts: int = 10, strict: bool = True) -> int:
     """
-    If strict=True (the default), only `start_port` itself is tried; if
-    it's busy this raises immediately instead of silently picking a
-    different port. This is the fix for a real bug: previously this
-    function silently walked forward through a port range, and NOTHING
-    downstream (CLI, tests) ever checked or reported which port was
-    actually bound - two peers, or a peer and a test harness, could end
-    up disagreeing about where the server actually is, producing
-    confusing 401/connection failures far from the real cause.
-    Pass strict=False to opt back into the old scan-forward behavior.
+    Tests binding on `bind_host` specifically (not a wildcard address),
+    since MCPv2 peers bind directly to their public IP by default (see
+    main()). If `bind_host` is a public/routable IP that isn't actually
+    assigned to a local network interface - the common case behind NAT,
+    home routers, or most cloud load balancers - this fails immediately
+    with an actionable error instead of letting uvicorn fail deep inside
+    its own startup with a less helpful stack trace.
+
+    If strict=True (default), only `start_port` itself is tried; if it's
+    busy this raises immediately instead of silently picking a different
+    port - two peers (or a peer and a test harness) disagreeing about
+    which port is actually bound is a real, previously-observed bug class.
+    Pass strict=False to opt back into scan-forward behavior.
     """
     attempts = 1 if strict else max_attempts
+    last_err = None
     for port in range(start_port, start_port + attempts):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
-                s.bind(('', port))
+                s.bind((bind_host, port))
                 return port
-            except OSError:
+            except OSError as e:
+                last_err = e
                 continue
     if strict:
         raise RuntimeError(
-            f"Port {start_port} is already in use. Pass --port-fallback to "
-            f"allow scanning forward, or choose a free port explicitly."
+            f"Could not bind {bind_host}:{start_port}. "
+            f"Underlying error: {last_err}. "
+            f"If {bind_host} is your PUBLIC IP but this machine is behind "
+            f"NAT/a router/a cloud load balancer, that IP is usually not "
+            f"assigned to any local network interface, so direct binding "
+            f"will always fail here - this is expected, not a bug. Fix by "
+            f"either: (a) running on a host where the public IP IS a local "
+            f"interface address (e.g. a cloud VM with a directly-attached "
+            f"public IP), or (b) passing --bind-host 0.0.0.0 explicitly to "
+            f"bind all local interfaces while still advertising the public "
+            f"IP via --public-ip for others to connect to."
         )
-    raise RuntimeError(f"No available port in range {start_port}-{start_port+max_attempts-1}")
+    raise RuntimeError(f"No available port in range {start_port}-{start_port+max_attempts-1} on {bind_host}")
 
 # ---------- CLI Entry Point ----------
 def main():
@@ -1086,7 +1101,12 @@ def main():
     parser = argparse.ArgumentParser(description="MCPv2 Peer - Full P2P AI Agent Protocol")
     parser.add_argument("--port", type=int, default=int(ENV_PORT), help="TCP port")
     parser.add_argument("--secret", help="Secret key (auto-generated)")
-    parser.add_argument("--bind-host", default="0.0.0.0", help="Bind address")
+    parser.add_argument("--bind-host", default=None,
+                        help="Bind address. Defaults to the public IP (--public-ip or "
+                             "auto-detected) - NOT 0.0.0.0. Only override this (e.g. to "
+                             "0.0.0.0) if you're behind NAT/a load balancer and need to "
+                             "bind all local interfaces while still advertising the "
+                             "public IP via --public-ip.")
     parser.add_argument("--public-ip", help="Override public IP")
     parser.add_argument("--target", help="Target URL to send a batch (client mode)")
     parser.add_argument("--slots", type=int, default=3, help="Number of slots")
@@ -1158,8 +1178,10 @@ def main():
             sys.exit(1)
         return
 
+    bind_host = args.bind_host or public_ip
+
     try:
-        port = find_available_port(args.port, strict=not args.port_fallback)
+        port = find_available_port(args.port, bind_host, strict=not args.port_fallback)
         if port != args.port:
             logger.info(f"Port {args.port} busy, using {port}")
     except RuntimeError as e:
@@ -1170,13 +1192,42 @@ def main():
         with open(args.port_file, "w") as f:
             f.write(str(port))
 
-    # Unambiguous, machine-parseable stdout marker so any caller (test
+    # A ready-to-share address for other peers to connect to. Note this
+    # deliberately does NOT bake in a working sessionId for a remote
+    # caller: session tokens are bound to the caller's own IP as *this*
+    # peer will observe it (see SecureSession), which is generally a
+    # different address than this peer's own public IP. A genuinely
+    # remote peer must fetch its own token from GET /mcpv2/session.
+    peer_address = f"mcpv2://{public_ip}:{port}/mcpv2"
+
+    # A locally-usable demo token, minted in-process (no HTTP round trip
+    # needed since we haven't started listening yet). This is only valid
+    # for a caller whose observed source IP equals `public_ip` - true for
+    # same-host testing, or in the (uncommon) case where this peer's
+    # public IP is also its outbound source IP for local calls. It is
+    # printed for convenience, clearly labeled, not as a universal token.
+    demo_session = SecureSession.create(public_ip, secret)
+    demo_address = f"{peer_address}?sessionId={demo_session}"
+
+    # Unambiguous, machine-parseable stdout markers so any caller (test
     # harness, CLI, orchestration script) can reliably discover the real
-    # bound port without guessing or parsing log prose.
+    # bound port/address without guessing or parsing log prose.
     print(f"MCPV2_BOUND_PORT={port}", flush=True)
+    print(f"MCPV2_PEER_ADDRESS={peer_address}", flush=True)
+    print(f"MCPV2_DEMO_SESSION_ADDRESS={demo_address}", flush=True)
+
+    print("=" * 70)
+    print(f"MCPv2 peer ready.")
+    print(f"  Share this address for others to connect to:")
+    print(f"    {peer_address}")
+    print(f"  They obtain their own sessionId via:")
+    print(f"    GET http://{public_ip}:{port}/mcpv2/session")
+    print(f"  Same-host / same-IP demo address (session pre-attached):")
+    print(f"    {demo_address}")
+    print("=" * 70)
 
     logger.info("Starting MCPv2 server...")
-    uvicorn.run(app, host=args.bind_host, port=port, log_level=args.log_level.lower())
+    uvicorn.run(app, host=bind_host, port=port, log_level=args.log_level.lower())
 
 if __name__ == "__main__":
     main()
