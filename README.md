@@ -53,6 +53,10 @@ a local interface, or pass `--bind-host 0.0.0.0` explicitly to bind all
 local interfaces while still *advertising* the public IP via `--public-ip`
 for others to connect to.
 
+Manually use below if you have NAT in your cloud and make sure the port is opened to external:
+
+python mcpv2.py --bind-host 0.0.0.0 --port 8000 --secret <mySharedSecret> --public-ip <public ip>
+
 ### The two addresses printed at startup
 
 ```
