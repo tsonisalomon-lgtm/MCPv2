@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-MCPv2 – Secure, Cross-Provider P2P AI Agent Protocol
+MCPv2 - Secure, Cross-Provider P2P AI Agent Protocol
 Supports Gemini, Claude, OpenAI, DeepSeek with full bidirectional translation.
 
 SECURITY MODEL (read this before deploying):
-MCPv2 uses a single shared HMAC secret between peers. Anyone holding the secret
-can mint valid sessions and call any registered skill. This is a "trusted mesh"
-model suitable for a closed set of agents you control (e.g. processes on a
-private network, or over mTLS-terminated links). It is NOT per-agent identity/
-authorization (no public-key auth, no scoped capabilities per peer) and the
-`pay` skill is a stub, not a real payment rail. Do not expose an MCPv2 peer
-directly to the open internet without a reverse proxy doing real authentication/
-authorization and TLS termination in front of it.
+  MCPv2 uses a single shared HMAC secret between peers. Anyone holding the
+  secret can mint valid sessions and call any registered skill. This is a
+  "trusted mesh" model suitable for a closed set of agents you control
+  (e.g. processes on a private network, or over mTLS-terminated links).
+  It is NOT per-agent identity/authorization (no public-key auth, no
+  scoped capabilities per peer) and the `pay` skill is a stub, not a
+  real payment rail. Do not expose an MCPv2 peer directly to the open
+  internet without a reverse proxy doing real authentication/authorization
+  and TLS termination in front of it.
 """
 
 import os
@@ -53,11 +54,16 @@ ENV_LOG_LEVEL = os.getenv("MCPV2_LOG_LEVEL", "INFO").upper()
 ENV_RATE_LIMIT = int(os.getenv("MCPV2_RATE_LIMIT", "200"))
 ENV_SESSION_RATE_LIMIT = int(os.getenv("MCPV2_SESSION_RATE_LIMIT", "20"))
 ENV_AUDIT_FILE = os.getenv("MCPV2_AUDIT_FILE", "mcpv2_audit.log")
-ENV_LLM_MODE = os.getenv("MCPV2_LLM_MODE", "1") == "1"  # Now True by default
+ENV_LLM_MODE = os.getenv("MCPV2_LLM_MODE", "0") == "1"
 ENV_SESSION_TIMEOUT = int(os.getenv("MCPV2_SESSION_TIMEOUT", "3600"))
-ENV_CLOCK_SKEW = int(os.getenv("MCPV2_CLOCK_SKEW", "300"))
+ENV_CLOCK_SKEW = int(os.getenv("MCPV2_CLOCK_SKEW", "300"))  # tolerance for future-dated tokens
 ENV_TOOL_TIMEOUT = int(os.getenv("MCPV2_TOOL_TIMEOUT", "30"))
 ENV_MEMORY_LIMIT_MB = int(os.getenv("MCPV2_MEMORY_LIMIT_MB", "256"))
+# Resolved to an ABSOLUTE path once, at import time, BEFORE any sandbox
+# chdir() can happen. This is the fix for the "uploaded files vanish"
+# bug: previously this stayed relative, and ToolSandbox.execute() chdirs
+# into a throwaway tempdir for every tool call, so relative file-store
+# paths resolved *inside* that tempdir and were deleted milliseconds later.
 ENV_FILE_STORE = os.path.abspath(os.getenv("MCPV2_FILE_STORE", "./mcpv2_files"))
 ENV_ENABLE_MTLS = os.getenv("MCPV2_ENABLE_MTLS", "0") == "1"
 
@@ -73,11 +79,16 @@ secret: Optional[str] = None
 registry = None
 current_session_id_var = ContextVar('current_session_id', default=None)
 llm_sessions: Dict[str, Dict] = {}
+# Optional revocation/bookkeeping list. NOT authoritative for expiry -
+# authoritative expiry is the TTL embedded in the signed token itself
+# (see SecureSession). This dict is only used so an operator can forcibly
+# revoke a specific session early (delete its entry) and so /health can
+# report an active-session count.
 sessions: Dict[str, Dict] = {}
 _tasks_lock = asyncio.Lock()
 
 # =============================================================================
-# LAYER 5 – AI Agent Adapter Layer (Provider‑Native)
+# LAYER 5 - AI Agent Adapter Layer (Provider-Native)
 # =============================================================================
 class AIProvider(Enum):
     CLAUDE = "claude"
@@ -98,62 +109,162 @@ class AIAdapter(ABC):
     @abstractmethod
     def to_native_tool(self, tool: ToolDefinition) -> Dict[str, Any]:
         pass
+
     @abstractmethod
     def from_native_call(self, native_call: Dict[str, Any]) -> Dict[str, Any]:
         pass
+
     @abstractmethod
     def to_native_response(self, result: Any) -> Dict[str, Any]:
         pass
+
     @abstractmethod
     def from_native_history(self, native_messages: List[Dict]) -> List[Dict]:
-        pass
-    @abstractmethod
-    def to_native_history(self, unified_messages: List[Dict]) -> List[Dict]:
+        """Convert provider-native message history to MCPv2 unified format."""
         pass
 
+    @abstractmethod
+    def to_native_history(self, unified_messages: List[Dict]) -> List[Dict]:
+        """Convert MCPv2 unified history to provider-native format."""
+        pass
+
+# ---------- Claude Adapter ----------
 class ClaudeAdapter(AIAdapter):
     def to_native_tool(self, tool: ToolDefinition) -> Dict[str, Any]:
-        return {"name": tool.name, "description": tool.description, "input_schema": {"type": "object", "properties": tool.parameters.get("properties", {}), "required": tool.required}}
+        return {
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": {
+                "type": "object",
+                "properties": tool.parameters.get("properties", {}),
+                "required": tool.required
+            }
+        }
+
     def from_native_call(self, native_call: Dict[str, Any]) -> Dict[str, Any]:
         return {"name": native_call.get("name"), "arguments": native_call.get("input", {})}
+
     def to_native_response(self, result: Any) -> Dict[str, Any]:
         return {"content": [{"type": "text", "text": str(result)}]}
-    def from_native_history(self, native_messages: List[Dict]) -> List[Dict]:
-        return [{"role": m.get("role"), "content": m.get("content", [{"text": ""}])[0].get("text", "")} for m in native_messages]
-    def to_native_history(self, unified_messages: List[Dict]) -> List[Dict]:
-        return [{"role": m.get("role"), "content": [{"type": "text", "text": m.get("content", "")}]} for m in unified_messages]
 
+    def from_native_history(self, native_messages: List[Dict]) -> List[Dict]:
+        # Claude uses: {"role": "user"/"assistant", "content": [ {block}, ... ]}
+        # FIX: the old version only ever read content[0], silently dropping
+        # every subsequent content block (e.g. mixed text + tool_use turns).
+        # We now flatten *all* text-bearing blocks in order.
+        unified = []
+        for msg in native_messages:
+            content = msg.get("content", "")
+            text = self._flatten_content(content)
+            unified.append({"role": msg.get("role"), "content": text})
+        return unified
+
+    @staticmethod
+    def _flatten_content(content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if "text" in block:
+                    parts.append(block["text"])
+                elif block.get("type") == "tool_use":
+                    parts.append(f"[tool_use:{block.get('name')} {json.dumps(block.get('input', {}))}]")
+                elif block.get("type") == "tool_result":
+                    parts.append(f"[tool_result:{block.get('tool_use_id')} {block.get('content', '')}]")
+            return "\n".join(parts)
+        return ""
+
+    def to_native_history(self, unified_messages: List[Dict]) -> List[Dict]:
+        native = []
+        for msg in unified_messages:
+            native.append({
+                "role": msg.get("role"),
+                "content": [{"type": "text", "text": msg.get("content", "")}]
+            })
+        return native
+
+# ---------- OpenAI Adapter ----------
 class OpenAIAdapter(AIAdapter):
     def to_native_tool(self, tool: ToolDefinition) -> Dict[str, Any]:
-        return {"type": "function", "function": {"name": tool.name, "description": tool.description, "strict": tool.strict, "parameters": {"type": "object", "properties": tool.parameters.get("properties", {}), "required": tool.required, "additionalProperties": False}}}
+        return {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "strict": tool.strict,
+                "parameters": {
+                    "type": "object",
+                    "properties": tool.parameters.get("properties", {}),
+                    "required": tool.required,
+                    "additionalProperties": False
+                }
+            }
+        }
+
     def from_native_call(self, native_call: Dict[str, Any]) -> Dict[str, Any]:
         func = native_call.get("function", {})
-        return {"name": func.get("name"), "arguments": json.loads(func.get("arguments", "{}"))}
+        raw_args = func.get("arguments", "{}")
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except json.JSONDecodeError:
+            args = {}
+        return {"name": func.get("name"), "arguments": args}
+
     def to_native_response(self, result: Any) -> Dict[str, Any]:
         return {"result": str(result)}
-    def from_native_history(self, native_messages: List[Dict]) -> List[Dict]:
-        return native_messages
-    def to_native_history(self, unified_messages: List[Dict]) -> List[Dict]:
-        return unified_messages
 
+    def from_native_history(self, native_messages: List[Dict]) -> List[Dict]:
+        # OpenAI: [{"role": "user", "content": "..."}, ...] - already unified shape.
+        return [{"role": m.get("role"), "content": m.get("content", "")} for m in native_messages]
+
+    def to_native_history(self, unified_messages: List[Dict]) -> List[Dict]:
+        return [{"role": m.get("role"), "content": m.get("content", "")} for m in unified_messages]
+
+# ---------- Gemini Adapter ----------
 class GeminiAdapter(AIAdapter):
     def to_native_tool(self, tool: ToolDefinition) -> Dict[str, Any]:
-        return {"functionDeclarations": [{"name": tool.name, "description": tool.description, "parameters": {"type": "object", "properties": tool.parameters.get("properties", {}), "required": tool.required}}]}
+        return {
+            "functionDeclarations": [{
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": tool.parameters.get("properties", {}),
+                    "required": tool.required
+                }
+            }]
+        }
+
     def from_native_call(self, native_call: Dict[str, Any]) -> Dict[str, Any]:
         func = native_call.get("functionCall", {})
         return {"name": func.get("name"), "arguments": func.get("args", {})}
+
     def to_native_response(self, result: Any) -> Dict[str, Any]:
         return {"response": str(result)}
+
     def from_native_history(self, native_messages: List[Dict]) -> List[Dict]:
+        # Gemini: [{"role": "user", "parts": [{"text": "..."}]}, ...]
         unified = []
         for msg in native_messages:
+            role = msg.get("role")
             parts = msg.get("parts", [])
-            content = " ".join(p.get("text", "") for p in parts)
-            unified.append({"role": msg.get("role"), "content": content})
+            content = "\n".join(p.get("text", "") for p in parts if isinstance(p, dict))
+            unified.append({"role": role, "content": content})
         return unified
-    def to_native_history(self, unified_messages: List[Dict]) -> List[Dict]:
-        return [{"role": m.get("role"), "parts": [{"text": m.get("content", "")}]} for m in unified_messages]
 
+    def to_native_history(self, unified_messages: List[Dict]) -> List[Dict]:
+        native = []
+        for msg in unified_messages:
+            native.append({
+                "role": msg.get("role"),
+                "parts": [{"text": msg.get("content", "")}]
+            })
+        return native
+
+# ---------- DeepSeek Adapter (OpenAI compatible) ----------
 class DeepSeekAdapter(OpenAIAdapter):
     pass
 
@@ -168,7 +279,7 @@ def get_adapter(provider: AIProvider) -> AIAdapter:
     return ADAPTERS[provider]
 
 # =============================================================================
-# LAYER 5b – MCPv2 Core Session Layer
+# LAYER 5b - MCPv2 Core Session Layer
 # =============================================================================
 class MCPErrorCode:
     PARSE_ERROR = -32700
@@ -217,6 +328,7 @@ class Skill(BaseModel):
     memory_limit_mb: int = ENV_MEMORY_LIMIT_MB
     signature: Optional[str] = None
 
+# ---------- Tool Registry ----------
 class ToolRegistry:
     def __init__(self):
         self._tools: Dict[str, Skill] = {}
@@ -241,7 +353,17 @@ class ToolRegistry:
         tools = self._tools.values()
         if provider:
             tools = [t for t in tools if t.provider is None or t.provider == provider]
-        return [{"name": s.name, "description": s.description, "inputSchema": s.input_schema, "version": s.version, "deprecated": s.deprecated, "signature": s.signature} for s in tools]
+        return [
+            {
+                "name": s.name,
+                "description": s.description,
+                "inputSchema": s.input_schema,
+                "version": s.version,
+                "deprecated": s.deprecated,
+                "signature": s.signature
+            }
+            for s in tools
+        ]
 
     def call(self, name: str, arguments: Dict[str, Any], peer_id: str = None) -> Any:
         skill = self.get(name)
@@ -252,17 +374,61 @@ class ToolRegistry:
         sandbox = ToolSandbox(timeout=skill.timeout, memory_limit_mb=skill.memory_limit_mb)
         return sandbox.execute(name, skill.handler, arguments)
 
+# ---------- Tool Sandbox ----------
 class ToolSandbox:
+    """
+    Scratch-directory isolation for a skill handler call. Does NOT apply
+    OS-level CPU/memory limits - see below for why that was removed.
+
+    NOTE: chdir() into a scratch tempdir is process-global state. Skill
+    handlers must NOT rely on relative paths resolving to anything
+    persistent - they must use absolute paths (ENV_FILE_STORE is resolved
+    absolute at import time specifically so this is safe). Concurrent
+    requests still share one process-wide CWD; this sandbox is a soft
+    guard against accidental relative-path writes, not a hard isolation
+    boundary. Do not run untrusted third-party handler code with this and
+    assume it's a security boundary - it isn't (no seccomp/namespace/uid
+    isolation). Use a real sandbox (container/gVisor/subprocess+seccomp)
+    if you ever load skills whose handler code you don't trust.
+
+    REMOVED, and why it matters: earlier versions of this class called
+    `resource.setrlimit(RLIMIT_AS, ...)` and `resource.setrlimit(RLIMIT_CPU, ...)`
+    on every single tool call, intending to cap that one call's memory and
+    CPU. That's not what those limits do. RLIMIT_AS caps the WHOLE
+    PROCESS's virtual address space, and RLIMIT_CPU caps the WHOLE
+    PROCESS's *cumulative* CPU time since it started - permanently, since
+    the soft and hard limits were set equal, so it can never be raised
+    back up afterward. In a persistent long-running FastAPI/uvicorn
+    server (which is what this is - not a short-lived subprocess that
+    exits after one call), that means the very FIRST tool call any peer
+    ever handles permanently caps that peer's entire remaining lifetime
+    to `memory_limit_mb` of total virtual memory - including uvicorn's
+    own event loop, every future connection, every future request,
+    forever. This is not a theoretical concern: it was reproduced while
+    testing this repository. Two peers were run through
+    `test_scenarios.py`'s repeated multi-iteration scenario suite, and by
+    the second iteration the memory-capped peer crashed with a raw
+    `MemoryError` inside uvloop's own event loop internals
+    (`uvloop.loop.Loop._read_from_self`), taking the whole server down -
+    every in-flight request then failed with a connection reset having
+    nothing to do with the request's own content.
+
+    If you need real per-call resource limits for untrusted skill code,
+    that requires actually isolating the call - a subprocess pool, a
+    container, or similar - not a rlimit applied in-place inside a
+    process that is also expected to keep serving other requests
+    afterward. That's real architecture work, intentionally not
+    half-implemented here in a way that would look like protection while
+    quietly being worse than no limit at all.
+    """
     def __init__(self, timeout: int = ENV_TOOL_TIMEOUT, memory_limit_mb: int = ENV_MEMORY_LIMIT_MB):
+        # Accepted for API/config compatibility (custom_skills.json can
+        # still specify these per skill) but intentionally not enforced
+        # as OS-level rlimits - see the class docstring above.
         self.timeout = timeout
         self.memory_limit_mb = memory_limit_mb
 
     def execute(self, tool_name: str, handler: Callable, arguments: Dict[str, Any]) -> Any:
-        try:
-            resource.setrlimit(resource.RLIMIT_AS, (self.memory_limit_mb * 1024 * 1024, self.memory_limit_mb * 1024 * 1024))
-            resource.setrlimit(resource.RLIMIT_CPU, (self.timeout, self.timeout + 5))
-        except (ImportError, AttributeError):
-            pass
         with tempfile.TemporaryDirectory() as tmpdir:
             old_cwd = os.getcwd()
             try:
@@ -284,43 +450,100 @@ class AgentCard:
     security: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict:
-        return {"name": self.name, "description": self.description, "version": self.version, "protocolVersion": self.protocol_version, "transports": self.transports, "skills": self.skills, "endpoints": self.endpoints, "security": self.security}
+        return {
+            "name": self.name,
+            "description": self.description,
+            "version": self.version,
+            "protocolVersion": self.protocol_version,
+            "transports": self.transports,
+            "skills": self.skills,
+            "endpoints": self.endpoints,
+            "security": self.security
+        }
 
 # ---------- Secure Session ----------
 class SecureSession:
+    """
+    Token format: base64url(payload) + "." + HMAC-SHA256(secret, payload)
+    payload = "<peer_ip>:<nonce>:<issued_at>:<ttl>"
+
+    FIX vs. the original implementation: expiry used to be split-brain -
+    a session present in the server's in-memory `sessions` dict was
+    checked against ENV_SESSION_TIMEOUT (up to 1hr), but ANY token with a
+    valid HMAC that was NOT in that dict (e.g. self-signed by a peer
+    calling SecureSession.create() locally, which is exactly what
+    send_batch() does) fell through to a stateless check that only
+    enforced a +/-300s window - meaning two tokens signed one second
+    apart could have wildly different effective lifetimes depending on
+    accounting bookkeeping, not security. Worse, the dict-based path
+    never actually re-verified the HMAC of the *live* request's IP against
+    a value independent of the dict, since dict presence didn't feed into
+    the signature check at all.
+
+    Now: the TTL is embedded in the signed payload itself so there is one
+    authoritative rule, checked one way, always: token is valid iff the
+    HMAC matches AND now <= issued_at + ttl AND issued_at <= now + clock_skew.
+    The in-memory `sessions` dict is now purely optional bookkeeping
+    (active-session counts, manual revocation) and is never consulted for
+    expiry decisions.
+    """
     @staticmethod
-    def create(peer_ip: str, shared_secret: str) -> str:
+    def create(peer_ip: str, shared_secret: str, ttl: Optional[int] = None) -> str:
+        ttl = ENV_SESSION_TIMEOUT if ttl is None else ttl
         nonce = base64.b64encode(os.urandom(16)).decode('ascii')
         timestamp = str(int(time.time()))
-        payload = f"{peer_ip}:{nonce}:{timestamp}"
+        payload = f"{peer_ip}:{nonce}:{timestamp}:{ttl}"
         signature = hmac.new(shared_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
         session_id = f"{base64.urlsafe_b64encode(payload.encode()).decode()}.{signature}"
-        sessions[session_id] = {"created_at": time.time(), "expires_at": time.time() + ENV_SESSION_TIMEOUT, "peer_ip": peer_ip}
+        sessions[session_id] = {
+            "created_at": time.time(),
+            "expires_at": time.time() + ttl,
+            "peer_ip": peer_ip
+        }
         return session_id
 
     @staticmethod
     def verify(session_id: str, shared_secret: str, client_ip: str) -> bool:
         try:
-            if session_id in sessions:
-                if time.time() > sessions[session_id]["expires_at"]:
-                    del sessions[session_id]
-                    return False
-                if sessions[session_id]["peer_ip"] != client_ip:
-                    return False
             parts = session_id.split('.')
             if len(parts) != 2:
                 return False
             payload_b64, sig = parts
             payload = base64.urlsafe_b64decode(payload_b64.encode()).decode()
-            ip, nonce, ts = payload.split(':')
+            fields = payload.split(':')
+            if len(fields) != 4:
+                return False
+            ip, nonce, ts, ttl = fields
+            ts = int(ts)
+            ttl = int(ttl)
+
             if ip != client_ip:
                 return False
-            if abs(int(ts) - int(time.time())) > ENV_CLOCK_SKEW:
-                return False
+
             expected = hmac.new(shared_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-            return hmac.compare_digest(sig, expected)
+            if not hmac.compare_digest(sig, expected):
+                return False
+
+            now = time.time()
+            if ts > now + ENV_CLOCK_SKEW:
+                return False  # token claims to be issued in the future
+            if now > ts + ttl:
+                return False  # token's own embedded TTL has elapsed
+
+            # Optional: allow explicit early revocation via the bookkeeping dict.
+            if session_id in sessions and sessions[session_id].get("revoked"):
+                return False
+
+            return True
         except Exception:
             return False
+
+    @staticmethod
+    def revoke(session_id: str) -> None:
+        if session_id in sessions:
+            sessions[session_id]["revoked"] = True
+        else:
+            sessions[session_id] = {"revoked": True}
 
 # ---------- Rate Limiter ----------
 class RateLimiter:
@@ -342,7 +565,11 @@ class RateLimiter:
             return False
 
 rate_limiter = RateLimiter(ENV_RATE_LIMIT)
-session_rate_limiter = RateLimiter(ENV_SESSION_RATE_LIMIT)
+# FIX: session *creation* used to be completely unthrottled, which let a
+# client trivially bypass the per-session rate limit by just minting a
+# fresh session for every request. Now session issuance is throttled
+# per client IP too.
+session_creation_limiter = RateLimiter(ENV_SESSION_RATE_LIMIT)
 
 # ---------- Audit Logger ----------
 class AuditLogger:
@@ -351,7 +578,7 @@ class AuditLogger:
         self._lock = asyncio.Lock()
 
     async def log(self, entry: Dict) -> None:
-        entry["timestamp"] = datetime.utcnow().isoformat()
+        entry["timestamp"] = datetime.now(timezone.utc).isoformat()
         async with self._lock:
             with open(self.filename, 'a') as f:
                 f.write(json.dumps(entry) + '\n')
@@ -359,6 +586,16 @@ class AuditLogger:
 audit_logger = AuditLogger()
 
 # ---------- Skills ----------
+INSTRUCTIONS = """
+# Instructions for AI Agent
+
+1. Greet the user politely.
+2. Answer questions concisely.
+3. Provide references when available.
+4. If asked about the weather, suggest checking a weather service.
+5. For file sharing, request the file via the `get_skill` method.
+"""
+
 def ask(query: str) -> Dict[str, Any]:
     session_id = current_session_id_var.get()
     if ENV_LLM_MODE and session_id:
@@ -374,16 +611,34 @@ def ask(query: str) -> Dict[str, Any]:
     else:
         return {"message": f"Generic response to: {query}"}
 
+def _safe_path(filename: str) -> Optional[str]:
+    """Join filename against the (absolute) file store, refusing traversal."""
+    safe_filename = os.path.basename(filename)
+    if not safe_filename or safe_filename in (".", ".."):
+        return None
+    filepath = os.path.join(ENV_FILE_STORE, safe_filename)
+    # Defence in depth against any future filename trick that survives basename().
+    if os.path.commonpath([os.path.abspath(filepath), ENV_FILE_STORE]) != ENV_FILE_STORE:
+        return None
+    return filepath
+
 def upload_file(filename: str, content_b64: str) -> Dict[str, Any]:
     try:
-        content = base64.b64decode(content_b64)
-        safe_filename = os.path.basename(filename)
-        if not safe_filename:
-            return {"error": "Invalid filename"}
-        filepath = os.path.join(ENV_FILE_STORE, safe_filename)
+        content = base64.b64decode(content_b64, validate=True)
+    except Exception:
+        return {"error": "Invalid base64 content"}
+    filepath = _safe_path(filename)
+    if not filepath:
+        return {"error": "Invalid filename"}
+    try:
         with open(filepath, 'wb') as f:
             f.write(content)
-        return {"status": "success", "filename": safe_filename, "size": len(content), "path": filepath}
+        return {
+            "status": "success",
+            "filename": os.path.basename(filepath),
+            "size": len(content),
+            "path": filepath
+        }
     except Exception as e:
         return {"error": f"Upload failed: {str(e)}"}
 
@@ -393,45 +648,80 @@ def list_files() -> Dict[str, Any]:
         for f in os.listdir(ENV_FILE_STORE):
             path = os.path.join(ENV_FILE_STORE, f)
             if os.path.isfile(path):
-                files.append({"name": f, "size": os.path.getsize(path), "modified": datetime.fromtimestamp(os.path.getmtime(path)).isoformat()})
+                files.append({
+                    "name": f,
+                    "size": os.path.getsize(path),
+                    "modified": datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc).isoformat()
+                })
         return {"files": files}
     except Exception as e:
         return {"error": f"List failed: {str(e)}"}
 
 def process_instructions(filename: str) -> Dict[str, Any]:
-    safe_filename = os.path.basename(filename)
-    filepath = os.path.join(ENV_FILE_STORE, safe_filename)
-    if not os.path.exists(filepath):
-        return {"error": f"File {safe_filename} not found"}
+    filepath = _safe_path(filename)
+    if not filepath or not os.path.exists(filepath):
+        return {"error": f"File {filename} not found"}
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
-        return {"filename": safe_filename, "content": content, "line_count": len(content.splitlines()), "char_count": len(content)}
+        return {
+            "filename": os.path.basename(filepath),
+            "content": content,
+            "line_count": len(content.splitlines()),
+            "char_count": len(content)
+        }
     except Exception as e:
         return {"error": f"Processing failed: {str(e)}"}
 
 def delete_file(filename: str) -> Dict[str, Any]:
-    safe_filename = os.path.basename(filename)
-    filepath = os.path.join(ENV_FILE_STORE, safe_filename)
-    if not os.path.exists(filepath):
-        return {"error": f"File {safe_filename} not found"}
+    filepath = _safe_path(filename)
+    if not filepath or not os.path.exists(filepath):
+        return {"error": f"File {filename} not found"}
     try:
         os.remove(filepath)
-        return {"status": "deleted", "filename": safe_filename}
+        return {"status": "deleted", "filename": os.path.basename(filepath)}
     except Exception as e:
         return {"error": f"Deletion failed: {str(e)}"}
 
-def get_skill(name: str, file: str, script: str, ref: str) -> Dict[str, Any]:
-    return {"skill_name": name, "file": file, "script": script, "reference": ref, "status": "available"}
+def get_skill(name: str, file: str = "", script: str = "", ref: str = "") -> Dict[str, Any]:
+    """Return metadata about a skill. NOTE: this does not execute `script` -
+    it is a descriptor field only, echoed back for the caller's own use."""
+    return {
+        "skill_name": name,
+        "file": file,
+        "script": script,
+        "reference": ref,
+        "status": "available"
+    }
 
 def ping(message: str = "ping") -> Dict[str, Any]:
-    return {"echo": message, "timestamp": datetime.utcnow().isoformat(), "latency_ms": 0}
+    return {
+        "echo": message,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "latency_ms": 0
+    }
 
 def pay(amount: float, currency: str = "USD", recipient: str = None) -> Dict[str, Any]:
-    return {"status": "pending", "amount": amount, "currency": currency, "recipient": recipient or "unknown", "transaction_id": f"txn_{int(time.time())}_{os.urandom(4).hex()}"}
+    """STUB. Does not move any real money. Kept for protocol-shape testing."""
+    return {
+        "status": "pending",
+        "amount": amount,
+        "currency": currency,
+        "recipient": recipient or "unknown",
+        "transaction_id": f"txn_{int(time.time())}_{os.urandom(4).hex()}",
+        "note": "stub only - no real payment rail is connected"
+    }
 
 def negotiate(capabilities: Dict[str, Any]) -> Dict[str, Any]:
-    return {"status": "negotiated", "accepted_capabilities": capabilities, "server_capabilities": {"supports_streaming": True, "max_batch_size": 100, "protocol_version": "2.1.0"}}
+    return {
+        "status": "negotiated",
+        "accepted_capabilities": capabilities,
+        "server_capabilities": {
+            "supports_streaming": True,
+            "max_batch_size": 100,
+            "protocol_version": "2.1.0"
+        }
+    }
 
 def translate_history(history: List[Dict], from_provider: str, to_provider: str) -> Dict[str, Any]:
     try:
@@ -448,27 +738,93 @@ def translate_history(history: List[Dict], from_provider: str, to_provider: str)
 def create_default_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.set_peer_id(public_ip or "unknown")
-    registry.register(Skill(name="ask", description="Ask a generic question; maintains context.", input_schema={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}, handler=ask, version="1.0.0"))
-    registry.register(Skill(name="upload_file", description="Upload a file (base64 encoded) to the peer's file store.", input_schema={"type": "object", "properties": {"filename": {"type": "string"}, "content_b64": {"type": "string"}}, "required": ["filename", "content_b64"]}, handler=upload_file, version="1.0.0"))
-    registry.register(Skill(name="list_files", description="List all files in the file store.", input_schema={"type": "object", "properties": {}}, handler=list_files, version="1.0.0"))
-    registry.register(Skill(name="process_instructions", description="Process an uploaded instructions.md file.", input_schema={"type": "object", "properties": {"filename": {"type": "string"}}, "required": ["filename"]}, handler=process_instructions, version="1.0.0"))
-    registry.register(Skill(name="delete_file", description="Delete a file from the file store.", input_schema={"type": "object", "properties": {"filename": {"type": "string"}}, "required": ["filename"]}, handler=delete_file, version="1.0.0"))
-    registry.register(Skill(name="get_skill", description="Retrieve a skill definition.", input_schema={"type": "object", "properties": {"name": {"type": "string"}, "file": {"type": "string"}, "script": {"type": "string"}, "ref": {"type": "string"}}, "required": ["name"]}, handler=get_skill, version="1.0.0"))
-    registry.register(Skill(name="ping", description="Check connectivity with a ping.", input_schema={"type": "object", "properties": {"message": {"type": "string"}}}, handler=ping, version="1.0.0"))
-    registry.register(Skill(name="pay", description="Initiate a payment request.", input_schema={"type": "object", "properties": {"amount": {"type": "number"}, "currency": {"type": "string"}, "recipient": {"type": "string"}}, "required": ["amount"]}, handler=pay, version="1.0.0"))
-    registry.register(Skill(name="negotiate", description="Negotiate capabilities with the peer.", input_schema={"type": "object", "properties": {"capabilities": {"type": "object"}}, "required": ["capabilities"]}, handler=negotiate, version="1.0.0"))
-    registry.register(Skill(name="translate_history", description="Translate conversation history between provider formats.", input_schema={"type": "object", "properties": {"history": {"type": "array"}, "from_provider": {"type": "string"}, "to_provider": {"type": "string"}}, "required": ["history", "from_provider", "to_provider"]}, handler=translate_history, version="1.0.0"))
+    registry.register(Skill(
+        name="ask", description="Ask a generic question; maintains context.",
+        input_schema={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+        handler=ask, version="1.0.0"
+    ))
+    registry.register(Skill(
+        name="upload_file", description="Upload a file (base64 encoded) to the peer's file store.",
+        input_schema={"type": "object", "properties": {
+            "filename": {"type": "string"}, "content_b64": {"type": "string"}},
+            "required": ["filename", "content_b64"]},
+        handler=upload_file, version="1.0.0"
+    ))
+    registry.register(Skill(
+        name="list_files", description="List all files in the file store.",
+        input_schema={"type": "object", "properties": {}},
+        handler=list_files, version="1.0.0"
+    ))
+    registry.register(Skill(
+        name="process_instructions", description="Process an uploaded instructions.md file.",
+        input_schema={"type": "object", "properties": {"filename": {"type": "string"}}, "required": ["filename"]},
+        handler=process_instructions, version="1.0.0"
+    ))
+    registry.register(Skill(
+        name="delete_file", description="Delete a file from the file store.",
+        input_schema={"type": "object", "properties": {"filename": {"type": "string"}}, "required": ["filename"]},
+        handler=delete_file, version="1.0.0"
+    ))
+    registry.register(Skill(
+        name="get_skill", description="Retrieve a skill definition (does not execute code).",
+        input_schema={"type": "object", "properties": {
+            "name": {"type": "string"}, "file": {"type": "string"},
+            "script": {"type": "string"}, "ref": {"type": "string"}},
+            "required": ["name"]},
+        handler=get_skill, version="1.0.0"
+    ))
+    registry.register(Skill(
+        name="ping", description="Check connectivity with a ping.",
+        input_schema={"type": "object", "properties": {"message": {"type": "string"}}},
+        handler=ping, version="1.0.0"
+    ))
+    registry.register(Skill(
+        name="pay", description="Initiate a payment request (stub, no real funds move).",
+        input_schema={"type": "object", "properties": {
+            "amount": {"type": "number"}, "currency": {"type": "string"}, "recipient": {"type": "string"}},
+            "required": ["amount"]},
+        handler=pay, version="1.0.0"
+    ))
+    registry.register(Skill(
+        name="negotiate", description="Negotiate capabilities with the peer.",
+        input_schema={"type": "object", "properties": {"capabilities": {"type": "object"}}, "required": ["capabilities"]},
+        handler=negotiate, version="1.0.0"
+    ))
+    registry.register(Skill(
+        name="translate_history", description="Translate conversation history between provider formats.",
+        input_schema={"type": "object", "properties": {
+            "history": {"type": "array"}, "from_provider": {"type": "string"}, "to_provider": {"type": "string"}},
+            "required": ["history", "from_provider", "to_provider"]},
+        handler=translate_history, version="1.0.0"
+    ))
     return registry
 
 # ---------- Handlers ----------
 def handle_initialize(params: Optional[Dict]) -> Dict:
     client_version = params.get("protocolVersion", "1.0.0") if params else "1.0.0"
     server_version = "2.1.0"
-    c_major = int(client_version.split('.')[0]) if client_version else 0
-    s_major = int(server_version.split('.')[0]) if server_version else 0
+    try:
+        c_major = int(client_version.split('.')[0])
+    except (ValueError, AttributeError):
+        c_major = -1
+    s_major = int(server_version.split('.')[0])
     if c_major != s_major:
-        return {"error": {"code": MCPErrorCode.VERSION_MISMATCH, "message": f"Protocol version mismatch: client {client_version}, server {server_version}"}}
-    return {"protocolVersion": server_version, "serverInfo": {"name": "MCPv2 Peer", "version": "2.0.0", "providers": [p.value for p in AIProvider], "rateLimits": {"requests_per_second": ENV_RATE_LIMIT}, "transports": ["http", "https"], "capabilities": {"batching": True, "streaming": True, "tasks": True, "file_transfer": True, "payments": True, "history_translation": True}}}
+        return {"error": {"code": MCPErrorCode.VERSION_MISMATCH,
+                           "message": f"Protocol version mismatch: client {client_version}, server {server_version}"}}
+    return {
+        "protocolVersion": server_version,
+        "serverInfo": {
+            "name": "MCPv2 Peer",
+            "version": "2.1.0",
+            "providers": [p.value for p in AIProvider],
+            "rateLimits": {"requests_per_second": ENV_RATE_LIMIT},
+            "transports": ["http", "https"],
+            "capabilities": {
+                "batching": True, "streaming": True, "tasks": True,
+                "file_transfer": True, "payments": True, "history_translation": True
+            }
+        }
+    }
 
 def handle_tools_list(registry: ToolRegistry, provider: Optional[str] = None) -> Dict:
     if provider:
@@ -491,6 +847,8 @@ def handle_tools_call(params: Dict, registry: ToolRegistry) -> Dict:
         raise ValueError(f"Tool error: {str(e)}")
     except PermissionError as e:
         raise PermissionError(f"Authorization error: {str(e)}")
+    except TypeError as e:
+        raise ValueError(f"Invalid arguments: {str(e)}")
     except Exception as e:
         raise RuntimeError(f"Execution error: {str(e)}")
 
@@ -505,7 +863,8 @@ async def process_slot_async(slot_data: Dict, registry: ToolRegistry, session_id
         if slot.method == "initialize":
             result = handle_initialize(slot.params)
             if "error" in result:
-                return SlotResponse(id=slot_id, error=JsonRpcError(code=result["error"]["code"], message=result["error"]["message"]))
+                return SlotResponse(id=slot_id, error=JsonRpcError(
+                    code=result["error"]["code"], message=result["error"]["message"]))
         elif slot.method == "tools/list":
             provider = slot.params.get("_provider") if slot.params else None
             result = handle_tools_list(registry, provider)
@@ -516,20 +875,28 @@ async def process_slot_async(slot_data: Dict, registry: ToolRegistry, session_id
                     adapter = get_adapter(AIProvider(provider_hint.lower()))
                     result = adapter.to_native_response(result)
                 except ValueError:
-                    return SlotResponse(id=slot_id, error=JsonRpcError(code=MCPErrorCode.UNSUPPORTED_PROVIDER, message=f"Unsupported provider: {provider_hint}", data={"supported": [p.value for p in AIProvider]}))
+                    return SlotResponse(id=slot_id, error=JsonRpcError(
+                        code=MCPErrorCode.UNSUPPORTED_PROVIDER,
+                        message=f"Unsupported provider: {provider_hint}",
+                        data={"supported": [p.value for p in AIProvider]}))
         else:
-            return SlotResponse(id=slot_id, error=JsonRpcError(code=MCPErrorCode.METHOD_NOT_FOUND, message="Method not found"))
+            return SlotResponse(id=slot_id, error=JsonRpcError(
+                code=MCPErrorCode.METHOD_NOT_FOUND, message="Method not found"))
         return SlotResponse(id=slot_id, result=result)
     except ValidationError as e:
         logger.warning(f"Validation error for slot {slot_id}: {e}")
-        return SlotResponse(id=slot_id, error=JsonRpcError(code=MCPErrorCode.INVALID_REQUEST, message="Invalid Request", data=str(e)))
+        return SlotResponse(id=slot_id, error=JsonRpcError(
+            code=MCPErrorCode.INVALID_REQUEST, message="Invalid Request", data=str(e)))
     except ValueError as e:
-        return SlotResponse(id=slot_id, error=JsonRpcError(code=MCPErrorCode.TOOL_EXECUTION_ERROR, message=str(e)))
+        return SlotResponse(id=slot_id, error=JsonRpcError(
+            code=MCPErrorCode.TOOL_EXECUTION_ERROR, message=str(e)))
     except PermissionError as e:
-        return SlotResponse(id=slot_id, error=JsonRpcError(code=MCPErrorCode.CAPABILITY_VIOLATION, message=str(e)))
+        return SlotResponse(id=slot_id, error=JsonRpcError(
+            code=MCPErrorCode.CAPABILITY_VIOLATION, message=str(e)))
     except Exception as e:
         logger.exception(f"Unexpected error slot {slot_id}")
-        return SlotResponse(id=slot_id, error=JsonRpcError(code=MCPErrorCode.INTERNAL_ERROR, message=f"Internal error: {str(e)}"))
+        return SlotResponse(id=slot_id, error=JsonRpcError(
+            code=MCPErrorCode.INTERNAL_ERROR, message=f"Internal error: {str(e)}"))
 
 # ---------- IP Auto-Detection ----------
 @lru_cache(maxsize=1)
@@ -560,127 +927,84 @@ async def validate_session(request: Request, sessionId: str = Header(...)) -> st
     client_ip = request.client.host
     if not SecureSession.verify(sessionId, secret, client_ip):
         raise HTTPException(status_code=401, detail="Invalid sessionId")
-    if not await session_rate_limiter.allow(sessionId):
-        raise HTTPException(status_code=429, detail="Session rate limit exceeded")
+    if not await rate_limiter.allow(sessionId):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
     return sessionId
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # NOTE: public_ip / secret / registry are set by main() before uvicorn
+    # starts. We only fill them in here as a fallback for the case where
+    # the app is imported and run without going through main() (e.g. tests
+    # using `uvicorn mcpv2:app` directly).
     global public_ip, secret, registry
-    public_ip = ENV_PUBLIC_IP or fetch_public_ip()
-    secret = ENV_SECRET or generate_secret()
-    registry = create_default_registry()
+    if public_ip is None:
+        public_ip = ENV_PUBLIC_IP or fetch_public_ip()
+    if secret is None:
+        secret = ENV_SECRET or generate_secret()
+    if registry is None:
+        registry = create_default_registry()
     logger.info("=" * 60)
-    logger.info(f"🌐 Public IP:   {public_ip}")
-    logger.info(f"🔑 Secret:      {secret[:8]}...")
-    logger.info(f"🚦 Rate limit:  {ENV_RATE_LIMIT} req/s")
-    logger.info(f"⏱️  Session timeout: {ENV_SESSION_TIMEOUT}s")
-    logger.info(f"📁 File store:  {ENV_FILE_STORE}")
-    logger.info(f"🤖 LLM mode:    {ENV_LLM_MODE}")
-    logger.info(f"🔒 mTLS:        {ENV_ENABLE_MTLS}")
-    if hasattr(app.state, "port") and app.state.port:
-        logger.info(f"🧭 MCPv2 address: mcpv2://{public_ip}:{app.state.port}/mcpv2")
+    logger.info(f"Public IP:   {public_ip}")
+    logger.info(f"Secret:      {secret[:8]}...")
+    logger.info(f"Rate limit:  {ENV_RATE_LIMIT} req/s")
+    logger.info(f"Session timeout: {ENV_SESSION_TIMEOUT}s")
+    logger.info(f"File store:  {ENV_FILE_STORE}")
+    logger.info(f"LLM mode:    {ENV_LLM_MODE}")
+    logger.info(f"mTLS:        {ENV_ENABLE_MTLS}")
     logger.info("=" * 60)
+    app.state.start_time = time.time()
     yield
 
-app = FastAPI(title="MCPv2 Peer", version="2.0.0", lifespan=lifespan)
-
-# ---------- Public Endpoints ----------
-@app.get("/mcpv2")
-async def root_info():
-    """Return the peer's MCPv2 address template and session endpoint."""
-    return {
-        "peer": f"mcpv2://{public_ip}:{app.state.port}/mcpv2?sessionId=<your_session_id>",
-        "session_endpoint": "/mcpv2/session",
-        "info": "Use GET /mcpv2/session to obtain a fresh sessionId."
-    }
-
-@app.get("/mcpv2/commands")
-async def list_commands():
-    """Return a structured list of MCPv2 CLI commands."""
-    return {
-        "commands": [
-            {
-                "name": "ReadyTo",
-                "syntax": "ReadyTo [--port <port>] [--secret <secret>] [--public-ip <ip>] [--bind-host <ip>] [--llm-mode]",
-                "description": "Start a local MCPv2 peer and print its mcpv2:// address.",
-                "example": "ReadyTo --port 9000 --secret mySecret --public-ip 203.0.113.42"
-            },
-            {
-                "name": "StopTo",
-                "syntax": "StopTo <port|address>",
-                "description": "Stop a peer previously started by ReadyTo.",
-                "example": "StopTo 8000   or   StopTo mcpv2://127.0.0.1:8000/mcpv2"
-            },
-            {
-                "name": "ConnectTo",
-                "syntax": "ConnectTo <address>",
-                "description": "Perform a full authentication round-trip with a remote peer.",
-                "example": "ConnectTo mcpv2://127.0.0.1:8000/mcpv2"
-            },
-            {
-                "name": "SentTo",
-                "syntax": "SentTo <content> <address> [--provider <provider>]",
-                "description": "Send a prompt (plain text) or a file (path) to the remote peer.",
-                "example": "SentTo \"Hello, how are you?\" mcpv2://127.0.0.1:8000/mcpv2 --provider claude",
-                "example_file": "SentTo instructions.md mcpv2://127.0.0.1:8000/mcpv2"
-            },
-            {
-                "name": "PayTo",
-                "syntax": "PayTo <amount> <address>",
-                "description": "Request a stub payment from the remote peer.",
-                "example": "PayTo 10.5 mcpv2://127.0.0.1:8000/mcpv2"
-            },
-            {
-                "name": "PingTo",
-                "syntax": "PingTo <address>",
-                "description": "Measure round-trip latency and echo a ping.",
-                "example": "PingTo mcpv2://127.0.0.1:8000/mcpv2"
-            },
-            {
-                "name": "SendTo",
-                "syntax": "SendTo <content> <address> [--provider <provider>]",
-                "description": "Alias for SentTo (same syntax).",
-                "example": "SendTo \"Hello\" mcpv2://127.0.0.1:8000/mcpv2"
-            },
-            {
-                "name": "StopPeer",
-                "syntax": "StopPeer <port|address>",
-                "description": "Alias for StopTo (same syntax).",
-                "example": "StopPeer 8000"
-            },
-            {
-                "name": "help",
-                "syntax": "help",
-                "description": "Show this help in the CLI.",
-                "example": "help"
-            },
-            {
-                "name": "exit/quit",
-                "syntax": "exit or quit",
-                "description": "Exit the CLI (stops any peers started by ReadyTo).",
-                "example": "exit"
-            }
-        ],
-        "address_format": "mcpv2://<host>:<port>/mcpv2?sessionId=<sessionId>",
-        "provider_flags": "claude | openai | gemini | deepseek",
-        "notes": "MCPv2 peers bind directly to their public IP by default. If behind NAT, use --public-ip <ip> and --bind-host 0.0.0.0."
-    }
+app = FastAPI(title="MCPv2 Peer", version="2.1.0", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "public_ip": public_ip, "secret_preview": secret[:8] + "..." if secret else None, "providers": [p.value for p in AIProvider], "rate_limit": ENV_RATE_LIMIT, "llm_mode": ENV_LLM_MODE, "session_timeout": ENV_SESSION_TIMEOUT, "active_sessions": len(sessions), "file_store": ENV_FILE_STORE, "mtls_enabled": ENV_ENABLE_MTLS, "uptime": time.time() - app.state.start_time if hasattr(app.state, "start_time") else 0}
+    return {
+        "status": "healthy",
+        "public_ip": public_ip,
+        "secret_preview": secret[:8] + "..." if secret else None,
+        "providers": [p.value for p in AIProvider],
+        "rate_limit": ENV_RATE_LIMIT,
+        "llm_mode": ENV_LLM_MODE,
+        "session_timeout": ENV_SESSION_TIMEOUT,
+        "active_sessions": len(sessions),
+        "file_store": ENV_FILE_STORE,
+        "mtls_enabled": ENV_ENABLE_MTLS,
+        "uptime": time.time() - app.state.start_time if hasattr(app.state, "start_time") else 0
+    }
 
 @app.get("/mcpv2/session")
 async def create_session(request: Request):
     client_ip = request.client.host
+    if not await session_creation_limiter.allow(client_ip):
+        raise HTTPException(status_code=429, detail="Session creation rate limit exceeded")
     session_id = SecureSession.create(client_ip, secret)
     return {"sessionId": session_id}
 
 @app.get("/mcpv2/agent-card")
 async def get_agent_card():
-    card = AgentCard(name=f"MCPv2 Peer at {public_ip}", description="MCPv2 AI Agent Peer with Full P2P + Cross-Provider Support", version="2.0.0", protocol_version="2.1.0", transports=["http", "https"], skills=registry.list(), endpoints={"mcpv2": "/mcpv2", "session": "/mcpv2/session", "health": "/health", "agent_card": "/mcpv2/agent-card"}, security={"auth_type": "hmac_session", "supports_mtls": ENV_ENABLE_MTLS, "session_timeout": ENV_SESSION_TIMEOUT, "rate_limit": ENV_RATE_LIMIT})
+    card = AgentCard(
+        name=f"MCPv2 Peer at {public_ip}",
+        description="MCPv2 AI Agent Peer with Full P2P + Cross-Provider Support",
+        version="2.1.0",
+        protocol_version="2.1.0",
+        transports=["http", "https"],
+        skills=registry.list(),
+        endpoints={
+            "mcpv2": "/mcpv2", "session": "/mcpv2/session",
+            "health": "/health", "agent_card": "/mcpv2/agent-card"
+        },
+        security={
+            "auth_type": "hmac_shared_secret",
+            "supports_mtls": ENV_ENABLE_MTLS,
+            "session_timeout": ENV_SESSION_TIMEOUT,
+            "rate_limit": ENV_RATE_LIMIT
+        }
+    )
     return JSONResponse(content=card.to_dict())
+
+MAX_BATCH_SIZE = 100
 
 @app.post("/mcpv2", dependencies=[Depends(validate_session)])
 async def mcpv2_endpoint(request: Request, sessionId: str = Header(...)):
@@ -690,16 +1014,22 @@ async def mcpv2_endpoint(request: Request, sessionId: str = Header(...)):
         raise HTTPException(status_code=400, detail="Invalid JSON")
     if not isinstance(body, list):
         raise HTTPException(status_code=400, detail="Payload must be a JSON array")
+    if len(body) > MAX_BATCH_SIZE:
+        raise HTTPException(status_code=413, detail=f"Batch too large (max {MAX_BATCH_SIZE})")
+
     tasks = [process_slot_async(item, registry, sessionId) for item in body]
     responses = await asyncio.gather(*tasks)
     for req, resp in zip(body, responses):
-        await audit_logger.log({"sessionId": sessionId, "method": req.get("method"), "skill": req.get("params", {}).get("name") if req.get("method") == "tools/call" else None, "status": "success" if not resp.get("error") else "error"})
-    return JSONResponse(content=[r.dict(exclude_none=True) for r in responses])
+        await audit_logger.log({
+            "sessionId": sessionId,
+            "method": req.get("method"),
+            "skill": req.get("params", {}).get("name") if req.get("method") == "tools/call" else None,
+            "status": "success" if not resp.error else "error",
+        })
+    return JSONResponse(content=[r.model_dump(exclude_none=True) for r in responses])
 
-@app.post("/mcpv2/ai/{provider}")
+@app.post("/mcpv2/ai/{provider}", dependencies=[Depends(validate_session)])
 async def ai_agent_endpoint(provider: str, request: Request, sessionId: str = Header(...)):
-    if secret is None:
-        raise HTTPException(status_code=500, detail="Server not initialized")
     try:
         prov = AIProvider(provider.lower())
     except ValueError:
@@ -707,9 +1037,9 @@ async def ai_agent_endpoint(provider: str, request: Request, sessionId: str = He
     adapter = get_adapter(prov)
     body = await request.json()
     tool_calls = []
-    if prov == AIProvider.CLAUDE:
+    if prov in (AIProvider.CLAUDE,):
         tool_calls = body.get("tool_calls", [])
-    elif prov in [AIProvider.OPENAI, AIProvider.DEEPSEEK]:
+    elif prov in (AIProvider.OPENAI, AIProvider.DEEPSEEK):
         tool_calls = body.get("tool_calls", [])
     elif prov == AIProvider.GEMINI:
         tool_calls = [body] if body.get("functionCall") else []
@@ -748,30 +1078,90 @@ def send_batch(target_url: str, slots: list, session_id: str = None) -> list:
         logger.error(f"Batch send failed: {e}")
         raise
 
-def find_available_port(start_port: int, max_attempts: int = 10) -> int:
-    for port in range(start_port, start_port + max_attempts):
+def find_available_port(start_port: int, bind_host: str, max_attempts: int = 10, strict: bool = True) -> int:
+    """
+    Tests binding on `bind_host` specifically (not a wildcard address),
+    since MCPv2 peers bind directly to their public IP by default (see
+    main()). If `bind_host` is a public/routable IP that isn't actually
+    assigned to a local network interface - the common case behind NAT,
+    home routers, or most cloud load balancers - this fails immediately
+    with an actionable error instead of letting uvicorn fail deep inside
+    its own startup with a less helpful stack trace.
+
+    If strict=True (default), only `start_port` itself is tried; if it's
+    busy this raises immediately instead of silently picking a different
+    port - two peers (or a peer and a test harness) disagreeing about
+    which port is actually bound is a real, previously-observed bug class.
+    Pass strict=False to opt back into scan-forward behavior.
+    """
+    attempts = 1 if strict else max_attempts
+    last_err = None
+    for port in range(start_port, start_port + attempts):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            # SO_REUSEADDR matters here: without it, this probe treats a
+            # port left in TIME_WAIT by a just-exited process as "busy"
+            # even though nothing is actually listening and the real
+            # server bind (asyncio's create_server, which uvicorn uses,
+            # defaults to SO_REUSEADDR on POSIX) would succeed just fine.
+            # That mismatch caused false "port busy" failures on quick
+            # consecutive test runs - a real, reproduced bug, not
+            # theoretical. This does NOT mask a genuinely-in-use port
+            # (an actual LISTENer still wins the bind), only stale
+            # TIME_WAIT sockets from a process that already exited.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                s.bind(('', port))
+                s.bind((bind_host, port))
                 return port
-            except OSError:
+            except OSError as e:
+                last_err = e
                 continue
-    raise RuntimeError(f"No available port in range {start_port}-{start_port+max_attempts-1}")
+    if strict:
+        raise RuntimeError(
+            f"Could not bind {bind_host}:{start_port}. "
+            f"Underlying error: {last_err}. "
+            f"If {bind_host} is your PUBLIC IP but this machine is behind "
+            f"NAT/a router/a cloud load balancer, that IP is usually not "
+            f"assigned to any local network interface, so direct binding "
+            f"will always fail here - this is expected, not a bug. Fix by "
+            f"either: (a) running on a host where the public IP IS a local "
+            f"interface address (e.g. a cloud VM with a directly-attached "
+            f"public IP), or (b) passing --bind-host 0.0.0.0 explicitly to "
+            f"bind all local interfaces while still advertising the public "
+            f"IP via --public-ip for others to connect to."
+        )
+    raise RuntimeError(f"No available port in range {start_port}-{start_port+max_attempts-1} on {bind_host}")
 
 # ---------- CLI Entry Point ----------
 def main():
     global public_ip, secret, registry
-    parser = argparse.ArgumentParser(description="MCPv2 Peer – Full P2P AI Agent Protocol")
+    parser = argparse.ArgumentParser(description="MCPv2 Peer - Full P2P AI Agent Protocol")
     parser.add_argument("--port", type=int, default=int(ENV_PORT), help="TCP port")
     parser.add_argument("--secret", help="Secret key (auto-generated)")
-    parser.add_argument("--bind-host", help="Bind address (default: same as --public-ip; use 0.0.0.0 to bind all interfaces)")
+    parser.add_argument("--bind-host", default=None,
+                        help="Bind address. Defaults to the public IP (--public-ip or "
+                             "auto-detected) - NOT 0.0.0.0. Only override this (e.g. to "
+                             "0.0.0.0) if you're behind NAT/a load balancer and need to "
+                             "bind all local interfaces while still advertising the "
+                             "public IP via --public-ip.")
     parser.add_argument("--public-ip", help="Override public IP")
-    parser.add_argument("--port-file", help="Write the actual bound port to this file (for test harness)")
     parser.add_argument("--target", help="Target URL to send a batch (client mode)")
     parser.add_argument("--slots", type=int, default=3, help="Number of slots")
     parser.add_argument("--skills", help="JSON file with custom skills")
     parser.add_argument("--version", action="version", version="MCPv2 2.1.0")
     parser.add_argument("--log-level", default=ENV_LOG_LEVEL, help="Log level")
+    parser.add_argument("--port-fallback", action="store_true",
+                        help="Allow silently scanning forward if --port is busy (off by default)")
+    parser.add_argument("--no-bind-fallback", action="store_true",
+                        help="Disable auto-fallback to --bind-host 0.0.0.0 when binding "
+                             "directly to the public IP fails (e.g. behind NAT/a cloud "
+                             "load balancer). By default this fallback is ON: MCPv2 will "
+                             "still try the public IP first, and only fall back to "
+                             "0.0.0.0 (while still advertising the public IP to other "
+                             "peers) if that specific bind fails. Pass this flag to "
+                             "instead fail loudly on that error, e.g. if you want to "
+                             "catch a NAT misconfiguration immediately rather than have "
+                             "it silently work around it.")
+    parser.add_argument("--port-file", help="If set, write the actual bound port to this file")
     args = parser.parse_args()
 
     logging.getLogger().setLevel(args.log_level.upper())
@@ -779,9 +1169,6 @@ def main():
     public_ip = args.public_ip or fetch_public_ip()
     secret = args.secret or generate_secret()
     registry = create_default_registry()
-
-    # Determine bind_host: default = public_ip (never 0.0.0.0), but allow override.
-    bind_host = args.bind_host if args.bind_host is not None else public_ip
 
     if args.skills:
         try:
@@ -812,19 +1199,22 @@ def main():
                     memory_limit_mb=skill_def.get("memory_limit_mb", ENV_MEMORY_LIMIT_MB)
                 )
                 registry.register(skill)
-            logger.info("✅ Custom skills loaded.")
+            logger.info("Custom skills loaded.")
         except Exception as e:
             logger.error(f"Failed to load skills: {e}")
             sys.exit(1)
 
     if args.target:
         slots = [
-            SlotRequest(id=1, method="initialize", params={"protocolVersion": "2.1.0"}).dict(),
-            SlotRequest(id=2, method="tools/list", params={}).dict(),
-            SlotRequest(id=3, method="tools/call", params={"name": "ask", "arguments": {"query": "Hello"}}).dict()
+            SlotRequest(id=1, method="initialize", params={"protocolVersion": "2.1.0"}).model_dump(),
+            SlotRequest(id=2, method="tools/list", params={}).model_dump(),
+            SlotRequest(id=3, method="tools/call", params={"name": "ask", "arguments": {"query": "Hello"}}).model_dump()
         ]
         for i in range(4, args.slots + 1):
-            slots.append(SlotRequest(id=i, method="tools/call", params={"name": "get_skill", "arguments": {"name": f"skill_{i}", "file": f"file_{i}.md", "script": "script.sh", "ref": f"ref_{i}"}}).dict())
+            slots.append(SlotRequest(id=i, method="tools/call", params={
+                "name": "get_skill",
+                "arguments": {"name": f"skill_{i}", "file": f"file_{i}.md", "script": "script.sh", "ref": f"ref_{i}"}
+            }).model_dump())
         logger.info(f"Sending {len(slots)} slots to {args.target} ...")
         try:
             response = send_batch(args.target, slots)
@@ -832,32 +1222,90 @@ def main():
         except Exception as e:
             logger.error(f"Batch failed: {e}")
             sys.exit(1)
-    else:
-        try:
-            port = find_available_port(args.port)
-            if port != args.port:
-                logger.info(f"Port {args.port} busy, using {port}")
-        except RuntimeError as e:
+        return
+
+    # bind_host default = public_ip (never 0.0.0.0) unless the person
+    # explicitly overrides it. Track whether it was explicit, since that
+    # changes whether we're allowed to auto-fallback below: if someone
+    # says --bind-host X, we respect that literally and fail loudly
+    # rather than silently binding somewhere else.
+    bind_host_was_explicit = args.bind_host is not None
+    bind_host = args.bind_host or public_ip
+
+    try:
+        port = find_available_port(args.port, bind_host, strict=not args.port_fallback)
+        if port != args.port:
+            logger.info(f"Port {args.port} busy, using {port}")
+    except RuntimeError as e:
+        # This is the common NAT/cloud-load-balancer case: the public IP
+        # isn't assigned to any local interface, so binding directly to
+        # it always fails - see the detailed message find_available_port
+        # already raises. Auto-recover by falling back to 0.0.0.0 (bind
+        # all local interfaces) while STILL advertising the real public
+        # IP in the peer address, UNLESS the person explicitly pinned
+        # --bind-host themselves (then we respect that literally and
+        # fail, since silently overriding an explicit choice would be
+        # worse than just erroring) or passed --no-bind-fallback.
+        if bind_host_was_explicit or args.no_bind_fallback:
             logger.error(e)
             sys.exit(1)
-        if args.port_file:
-            with open(args.port_file, 'w') as f:
-                f.write(str(port))
-        # Validate that the bind address is actually assigned to a local interface
-        # (unless it's 0.0.0.0, which binds all interfaces).
-        if bind_host != "0.0.0.0":
-            try:
-                socket.gethostbyname(bind_host)
-            except socket.gaierror:
-                logger.error(f"❌ Bind address '{bind_host}' does not resolve to a local interface. "
-                             f"Use --bind-host 0.0.0.0 to bind all interfaces, or ensure '{bind_host}' "
-                             f"is assigned to this machine.")
-                sys.exit(1)
-        app.state.port = port
-        app.state.public_ip = public_ip
-        app.state.start_time = time.time()
-        logger.info(f"Starting MCPv2 server on {bind_host}:{port} (advertising {public_ip})...")
-        uvicorn.run(app, host=bind_host, port=port, log_level=args.log_level.lower())
+        logger.warning(
+            f"Could not bind directly to public IP {bind_host}:{args.port} "
+            f"(likely NAT/cloud load balancer - the public IP isn't a local "
+            f"interface address here). Falling back to --bind-host 0.0.0.0 "
+            f"automatically; still advertising {public_ip} as the public "
+            f"address for other peers to connect to. Pass --no-bind-fallback "
+            f"to disable this and fail loudly instead next time."
+        )
+        bind_host = "0.0.0.0"
+        try:
+            port = find_available_port(args.port, bind_host, strict=not args.port_fallback)
+            if port != args.port:
+                logger.info(f"Port {args.port} busy, using {port}")
+        except RuntimeError as e2:
+            logger.error(f"Fallback bind to 0.0.0.0 also failed: {e2}")
+            sys.exit(1)
+
+    if args.port_file:
+        with open(args.port_file, "w") as f:
+            f.write(str(port))
+
+    # A ready-to-share address for other peers to connect to. Note this
+    # deliberately does NOT bake in a working sessionId for a remote
+    # caller: session tokens are bound to the caller's own IP as *this*
+    # peer will observe it (see SecureSession), which is generally a
+    # different address than this peer's own public IP. A genuinely
+    # remote peer must fetch its own token from GET /mcpv2/session.
+    peer_address = f"mcpv2://{public_ip}:{port}/mcpv2"
+
+    # A locally-usable demo token, minted in-process (no HTTP round trip
+    # needed since we haven't started listening yet). This is only valid
+    # for a caller whose observed source IP equals `public_ip` - true for
+    # same-host testing, or in the (uncommon) case where this peer's
+    # public IP is also its outbound source IP for local calls. It is
+    # printed for convenience, clearly labeled, not as a universal token.
+    demo_session = SecureSession.create(public_ip, secret)
+    demo_address = f"{peer_address}?sessionId={demo_session}"
+
+    # Unambiguous, machine-parseable stdout markers so any caller (test
+    # harness, CLI, orchestration script) can reliably discover the real
+    # bound port/address without guessing or parsing log prose.
+    print(f"MCPV2_BOUND_PORT={port}", flush=True)
+    print(f"MCPV2_PEER_ADDRESS={peer_address}", flush=True)
+    print(f"MCPV2_DEMO_SESSION_ADDRESS={demo_address}", flush=True)
+
+    print("=" * 70)
+    print(f"MCPv2 peer ready.")
+    print(f"  Share this address for others to connect to:")
+    print(f"    {peer_address}")
+    print(f"  They obtain their own sessionId via:")
+    print(f"    GET http://{public_ip}:{port}/mcpv2/session")
+    print(f"  Same-host / same-IP demo address (session pre-attached):")
+    print(f"    {demo_address}")
+    print("=" * 70)
+
+    logger.info("Starting MCPv2 server...")
+    uvicorn.run(app, host=bind_host, port=port, log_level=args.log_level.lower())
 
 if __name__ == "__main__":
     main()
